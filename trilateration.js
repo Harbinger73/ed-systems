@@ -1,3 +1,183 @@
+var Region = function(center) {
+	var regionSize = 1;	// 1/32 Ly grid locations to search around candidate coordinate
+
+	this.origins = [center];
+
+	this.minx = Math.floor(center.x*32-regionSize)/32;
+	this.maxx = Math.ceil(center.x*32+regionSize)/32;
+	this.miny = Math.floor(center.y*32-regionSize)/32;
+	this.maxy = Math.ceil(center.y*32+regionSize)/32;
+	this.minz = Math.floor(center.z*32-regionSize)/32;
+	this.maxz = Math.ceil(center.z*32+regionSize)/32;
+	
+	// number of grid coordinates in the region
+	// for a region that has not been merged this is typically (2*regionSize)^3 (though if the center
+	// was grid aligned it will be (2*regionsize-1)^3)
+	this.volume = function() {
+		return 32768*(this.maxx-this.minx+1/32)*(this.maxy-this.miny+1/32)*(this.maxz-this.minz+1/32);
+	};
+
+	// p has properties x, y, z. returns true if p is in this region, false otherwise
+	this.contains = function(p) {
+		return (p.x >= this.minx && p.x <= this.maxx
+				&& p.y >= this.miny && p.y <= this.maxy
+				&& p.z >= this.minz && p.z <= this.maxz);
+	}
+	
+	// returns a new region that represents the union of this and r
+	this.union = function(r) {
+		if (!(r instanceof Region)) return null;
+
+		var u = new Region({x: 0, y: 0, z: 0});
+		u.origins = this.origins.concat(r.origins);
+		u.minx = Math.min(this.minx, r.minx);
+		u.miny = Math.min(this.miny, r.miny);
+		u.minz = Math.min(this.minz, r.minz);
+		u.maxx = Math.max(this.maxx, r.maxx);
+		u.maxy = Math.max(this.maxy, r.maxy);
+		u.maxz = Math.max(this.maxz, r.maxz);
+
+		return u;
+	};
+	
+	// returns the highest coordinate of the vector from p to the closest origin point. this is the
+	// minimum value of region size (in Ly) that would include the specified point
+	this.centrality = function(p) {
+		var i, d, best = null;
+		for (i = 0; i < this.origins.length; i++) {
+			d = Math.max(
+				Math.abs(this.origins[i].x - p.x),
+				Math.abs(this.origins[i].y - p.y),
+				Math.abs(this.origins[i].z - p.z)
+			);
+			if (d < best || best === null) best = d;
+		}
+		return best;
+	}
+	
+	this.toString = function() {
+		return "Region ["+this.minx+", "+this.miny+", "+this.minz
+			+"] - ["+this.maxx+", "+this.maxy+", "+this.maxz+"] ("+this.volume()+" points)";
+	};
+};
+
+var Trilateration = function () {
+	this.distances = [];
+
+	// dist is an object with properties x, y, z, distance
+	this.addDistance = function(dist) {
+		this.distances.push(dist);
+		if (this.distances.length >= 3) run();
+	};
+
+	var self = this;
+
+	function getRegions() {
+		var regions = [];
+		// find candidate locations by trilateration on all combinations of the input distances
+		// expand candidate locations to regions, combining as necessary
+		for (i1 = 0; i1 < self.distances.length; i1++) {
+			for (i2 = i1+1; i2 < self.distances.length; i2++) {
+				for (i3 = i2+1; i3 < self.distances.length; i3++) {
+			 		var candidates = getCandidates(self.distances, i1, i2, i3);
+			 		$.each(candidates, function() {
+						var r = new Region(this);
+						// see if there is existing region we can merge this new one into
+						for (var j = 0; j < regions.length; j++) {
+							var u = r.union(regions[j]);
+							if (u.volume() < r.volume() + regions[j].volume()) {
+								// volume of union is less than volume of individual regions so merge them
+								regions[j] = u;
+								// TODO should really rescan regions to see if there are other existing regions that can be merged into this
+								r = null;	// clear r so we know not to add it
+								break;
+							}
+						}
+						if (r !== null) {
+							regions.push(r);
+						}
+			 		});
+				}
+			}
+		}
+
+//		console.log("Candidate regions:");
+//		$.each(regions, function() {
+//			console.log(this.toString());
+//		});
+		return regions;
+	}
+
+	function checkDistances(p) {
+		var count = 0;
+		
+		$.each(self.distances, function() {
+			var dp = 2;
+
+			if (typeof this.distance === 'string') {
+				// if dist is a string then check if it has exactly 3 decimal places:
+				if (this.distance.indexOf('.') === this.distance.length-4) dp = 3;
+			} else if (this.distance.toFixed(3) === this.distance.toString()) {
+				// assume it's 3 dp if its 3 dp rounded string matches the string version
+				dp = 3;
+			}
+
+			if (this.distance == eddist(p, this, dp)) count++;
+		});
+
+		return count;
+	}
+
+	function run() {
+		self.regions = getRegions();
+		// check the number of matching distances for each grid location in each region
+		// track the best number of matches (and the corresponding locations) and the next
+		// best number
+		self.bestCount = 0;
+		self.best = [];
+		self.nextBest = 0;
+
+		$.each(self.regions, function() {
+			this.bestCount = 0;
+			this.best = [];
+			this.nextBest = 0;
+			for (var x = this.minx; x <= this.maxx; x+= 1/32) {
+				for (var y = this.miny; y <= this.maxy; y+= 1/32) {
+					for (var z = this.minz; z <= this.maxz; z+= 1/32) {
+						var p = {x: x, y: y, z: z};
+						var matches = checkDistances(p);
+						if (matches > this.bestCount) {
+							this.nextBest = this.bestCount;
+							this.bestCount = matches;
+							this.best = [p];
+						} else if (matches === this.bestCount) {
+							this.best.push(p);
+						} else if (matches > this.nextBest) {
+							this.nextBest = matches;
+						}
+						if (matches > self.bestCount) {
+							self.nextBest = self.bestCount;
+							self.bestCount = matches;
+							self.best = [p];
+						} else if (matches === self.bestCount) {
+							var found = false;
+							$.each(self.best, function() {
+								if (this.x === p.x && this.y === p.y && this.z === p.z) {
+									found = true;
+									return false;
+								}
+							});
+							if (!found) self.best.push(p);
+						} else if (matches > self.nextBest) {
+							self.nextBest = matches;
+						}
+					}
+				}
+			}
+		});
+	}
+};
+
 // dists is an array of reference objects (properties x, y, z, distance)
 // returns an object containing the best candidate found (properties x, y, z, totalSqErr, i1, i2, i3)
 // i1, i2, i3 are the indexes into dists[] that were reference points for the candidate
